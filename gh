@@ -1,2 +1,383 @@
 > ![sudo cp -opt-home-network-bot-bot.py ~-bot.py (1).png](https://github.com/user-attachments/assets/12ecbff1-86e0-4358-8a1f-6bbff77bd63b)
-> 
+> #!/usr/bin/env python3
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+BOT_DIR = "/opt/home-network-bot"
+CONFIG_PATH = os.path.join(BOT_DIR, "config.json")
+BLOCKED_FILE = os.path.join(BOT_DIR, "blocked_ips.txt")
+BLOCK_LOG = os.path.join(BOT_DIR, "block_events.log")
+ALLOWED_FILE = os.path.join(BOT_DIR, "allowed_ips.txt")
+
+NFT_FAMILY = "inet"
+NFT_TABLE = "homebot"
+NFT_SET = "blocked_ipv4"
+NFT_CHAIN = "input"
+
+
+def ensure_secure_directory():
+    os.makedirs(BOT_DIR, mode=0o700, exist_ok=True)
+    os.chmod(BOT_DIR, 0o700)
+
+
+def ensure_files():
+    for path in [BLOCKED_FILE, ALLOWED_FILE, BLOCK_LOG]:
+        Path(path).touch(exist_ok=True)
+        os.chmod(path, 0o600)
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as file:
+            config = json.load(file)
+    except FileNotFoundError:
+        config = {
+            "log_paths": ["/var/log/auth.log", "/var/log/syslog"],
+            "alert_channel": "none",
+            "telegram_bot_token": "",
+            "telegram_chat_id": "",
+            "discord_webhook": "",
+            "threshold_failed_attempts": 3,
+            "block_duration_minutes": 60,
+            "allowed_ips": ["127.0.0.1", "192.168.1.0/24"],
+        }
+        with open(CONFIG_PATH, "w", encoding="utf-8") as file:
+            json.dump(config, file, indent=2)
+    return config
+
+
+def get_blocked_ips():
+    blocked = set()
+    try:
+        with open(BLOCKED_FILE, "r", encoding="utf-8") as file:
+            for line_number, line in enumerate(file, start=1):
+                value = line.strip()
+                if not value:
+                    continue
+                try:
+                    address = ipaddress.ip_address(value)
+                except ValueError:
+                    print(f"Ignoring invalid IP on line {line_number}: {value}")
+                    continue
+                if address.version != 4:
+                    print(f"Ignoring unsupported IPv6 address on line {line_number}: {value}")
+                    continue
+                blocked.add(str(address))
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        raise RuntimeError(f"Could not read blocklist {BLOCKED_FILE}: {exc}") from exc
+    return blocked
+
+
+def append_blocked(ip):
+    # Validate before persisting
+    ipaddress.ip_address(ip)
+
+    blocked = get_blocked_ips()
+    blocked.add(ip)
+
+    directory = os.path.dirname(BLOCKED_FILE) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(prefix=".blocked_ips.", dir=directory, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            for entry in sorted(blocked):
+                file.write(entry + "\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, BLOCKED_FILE)
+        os.chmod(BLOCKED_FILE, 0o600)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def log_block(ip, duration_minutes):
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with open(BLOCK_LOG, "a", encoding="utf-8") as file:
+        file.write(f"{timestamp}\tip={ip}\tduration_minutes={duration_minutes}\n")
+
+
+def ip_in_allowed(ip, allowed):
+    for rule in allowed:
+        try:
+            if rule == "127.0.0.1" and ip == "127.0.0.1":
+                return True
+            if "/" in rule:
+                net = ipaddress.ip_network(rule, strict=False)
+                if ipaddress.ip_address(ip) in net:
+                    return True
+            if ip == rule:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def run_nft(args):
+    try:
+        subprocess.run(
+            ["nft", *args],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return True
+    except FileNotFoundError:
+        print("Error: nft is not installed or not in PATH.")
+        return False
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        if "File exists" in stderr or "already exists" in stderr:
+            return True
+        if "No such file or directory" in stderr:
+            print(f"nftables setup missing: {stderr}")
+        else:
+            print(f"nftables error: {stderr}")
+        return False
+
+
+def ensure_nftables():
+    # Create table if it does not exist
+    run_nft(["add", "table", NFT_FAMILY, NFT_TABLE])
+
+    # Create set if it does not exist
+    run_nft([
+        "add", "set",
+        NFT_FAMILY,
+        NFT_TABLE,
+        NFT_SET,
+        "{",
+        "type", "ipv4_addr;",
+        "flags", "timeout;",
+        "}"
+    ])
+
+    # Create chain if it does not exist
+    run_nft([
+        "add", "chain",
+        NFT_FAMILY,
+        NFT_TABLE,
+        NFT_CHAIN,
+        "{",
+        "type", "filter",
+        "hook", "input",
+        "priority", "-100;",
+        "policy", "accept;",
+        "}"
+    ])
+
+    # Add rule if it does not exist
+    run_nft([
+        "add", "rule",
+        NFT_FAMILY,
+        NFT_TABLE,
+        NFT_CHAIN,
+        "ip", "saddr", f"@{NFT_SET}", "drop"
+    ])
+
+
+def add_nft_block(ip, duration_seconds=3600):
+    """
+    Add an IPv4 address to the nftables blocklist.
+    The entry expires after duration_seconds.
+    """
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        print(f"Invalid IP address: {ip}")
+        return False
+
+    if address.version != 4:
+        print(f"Skipping unsupported IPv6 address: {ip}")
+        return False
+
+    try:
+        duration_seconds = int(duration_seconds)
+    except (TypeError, ValueError):
+        print(f"Invalid block duration: {duration_seconds}")
+        return False
+
+    if duration_seconds <= 0:
+        print("Block duration must be greater than zero")
+        return False
+
+    normalized_ip = str(address)
+
+    return run_nft([
+        "add",
+        "element",
+        NFT_FAMILY,
+        NFT_TABLE,
+        NFT_SET,
+        "{",
+        normalized_ip,
+        "timeout",
+        f"{duration_seconds}s",
+        "}",
+    ])
+
+
+def block_ip(ip, config):
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        print(f"Invalid IP address: {ip}")
+        return False
+
+    if address.version != 4:
+        print(f"Skipping unsupported IPv6 address: {ip}")
+        return False
+
+    normalized_ip = str(address)
+    allowed_ips = config.get("allowed_ips", [])
+
+    if ip_in_allowed(normalized_ip, allowed_ips):
+        print(f"Refusing to block allowlisted IP: {normalized_ip}")
+        return False
+
+    try:
+        duration_minutes = int(config.get("block_duration_minutes", 60))
+    except (TypeError, ValueError):
+        duration_minutes = 60
+
+    duration_minutes = max(1, duration_minutes)
+    duration_seconds = duration_minutes * 60
+
+    if not add_nft_block(normalized_ip, duration_seconds):
+        print(f"Failed to add {normalized_ip} to the nftables blocklist")
+        return False
+
+    try:
+        log_block(normalized_ip, duration_minutes)
+    except OSError as exc:
+        print(f"Warning: could not write block audit log: {exc}")
+
+    try:
+        append_blocked(normalized_ip)
+    except OSError as exc:
+        print(f"Warning: {normalized_ip} was blocked by nftables, but the local blocklist could not be updated: {exc}")
+
+    print(f"Blocked {normalized_ip} using nftables for {duration_minutes} minutes")
+    return True
+
+
+def extract_ip(text):
+    match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
+    if not match:
+        return None
+    ip = match.group(0)
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return None
+    if all(0 <= int(p) <= 255 for p in parts):
+        return ip
+    return None
+
+
+def suspicious_log_match(line):
+    patterns = [
+        "Failed password",
+        "authentication failure",
+        "invalid user",
+        "sudo: pam_unix",
+        "sshd: error: maximum authentication attempts exceeded",
+        "too many authentication failures",
+        "connection closed",
+        "Attempted login",
+        "port scan",
+        "Nmap",
+    ]
+    text = line.lower()
+    return any(p.lower() in text for p in patterns)
+
+
+def read_lines(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as file:
+            return file.readlines()
+    except FileNotFoundError:
+        return []
+
+
+def detect_suspicious_ips(log_paths, config):
+    seen = {}
+    for path in log_paths:
+        for line in read_lines(path):
+            if not suspicious_log_match(line):
+                continue
+            ip = extract_ip(line)
+            if not ip:
+                continue
+            if ip_in_allowed(ip, config.get("allowed_ips", [])):
+                continue
+            seen.setdefault(ip, 0)
+            seen[ip] += 1
+
+    threshold = int(config.get("threshold_failed_attempts", 3))
+    for ip, count in seen.items():
+        if count < threshold:
+            continue
+        if block_ip(ip, config):
+            print(f"Suspicious IP {ip} reached {count} matches; blocked.")
+        else:
+            print(f"Suspicious IP {ip} reached {count} matches; no block applied.")
+
+
+def tail_monitor(config):
+    state = {}
+    for path in config.get("log_paths", []):
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8", errors="replace") as file:
+            state[path] = file.tell()
+
+    while True:
+        for path in config.get("log_paths", []):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as file:
+                    current_pos = state.get(path, 0)
+                    file.seek(current_pos)
+                    new_lines = file.readlines()
+                    state[path] = file.tell()
+                    for line in new_lines:
+                        if not suspicious_log_match(line):
+                            continue
+                        ip = extract_ip(line)
+                        if not ip:
+                            continue
+                        if ip_in_allowed(ip, config.get("allowed_ips", [])):
+                            continue
+                        if block_ip(ip, config):
+                            print(f"Blocked suspicious source: {ip}")
+            except FileNotFoundError:
+                continue
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    ensure_secure_directory()
+    ensure_files()
+    config = load_config()
+
+    # Ensure nftables objects exist before using them
+    ensure_nftables()
+
+    # Initial scan of existing logs
+    detect_suspicious_ips(config.get("log_paths", []), config)
+
+    # Continuous monitoring
+    tail_monitor(config)
